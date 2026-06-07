@@ -22,6 +22,7 @@ Before running the parser, ask the user THREE questions:
 - For **single report**: ask once.
 - For **multiple reports** (comparison): ask focus routes and IPv6 preference once, then price **per report** in order.
 - Pass collected info to the parser via `--focus-routes`, `--price`, and `--skip-ipv6` flags.
+- Price strings may use USD/CNY/EUR/HKD and monthly or annual periods, e.g. `$5/mo`, `29元/月`, `€4/月`, `HK$30/mo`, `$60/year`.
 
 ### Phase 2 — Fetch & Analyze
 
@@ -71,10 +72,10 @@ Every dimension receives a letter grade:
 | **电信回国** | CN2GIA > CN2 > 10099 > CMI > 4837 > 163 > HE |
 | **联通回国** | 10099/9929 > CMI > 4837 > 163 > HE |
 | **移动回国** | CMIN2 > CMI > 163 > HE |
-| **国内速度** | Download Mbps to China, retransmit rate |
-| **国际带宽** | Cross-border throughput to major regions |
+| **国内速度** | Receive Mbps and latency to China nodes |
+| **国际带宽** | Send/receive throughput and retransmits to major regions |
 | **流媒体解锁** | Count of unlocked services + AI (ChatGPT) |
-| **性价比** | (only when --price provided) Composite vs monthly cost |
+| **性价比** | (only when --price provided) Composite vs monthly USD cost; non-USD prices use built-in approximate conversion rates |
 
 ### Retransmit interpretation
 
@@ -112,7 +113,7 @@ Context (collected in Phase 1):
   --focus-routes ROUTES    Comma-separated route names to highlight.
                            e.g. "上海电信,北京联通,广州移动"
   --price PRICE            Price info string. Repeatable for comparison mode.
-                           e.g. --price "续费$5.99/月"
+                           e.g. --price "续费$5.99/月", --price "29元/月", --price "$60/year"
   --skip-ipv6             Omit IPv6 route blocks, detour warnings, and IPv6
                            IP quality sections from output.
 
@@ -169,6 +170,9 @@ python scripts/parse_nodequality_report.py --json "<url>" | python scripts/save_
 
 # Direct mode (calls parser internally)
 python scripts/save_report.py --model "KVM-2G" --price "$5/mo" "https://nodequality.com/r/<token>"
+
+# Use a custom local library directory
+python scripts/save_report.py --library-dir "./my-vps-library" --model "KVM-2G" "<url>"
 
 # List saved reports
 python scripts/save_report.py --list

@@ -20,10 +20,18 @@ import argparse
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+
+if hasattr(sys.stdin, "reconfigure"):
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # --- Paths ---
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -31,6 +39,12 @@ PARSER = SCRIPT_DIR / "parse_nodequality_report.py"
 REPORTS_DIR = Path("vps-reports")
 JSON_DIR = REPORTS_DIR / "json"
 CSV_PATH = REPORTS_DIR / "reports.csv"
+APPROX_USD_RATES = {
+    "USD": 1.0,
+    "CNY": 0.14,
+    "EUR": 1.08,
+    "HKD": 0.128,
+}
 
 CSV_COLUMNS = [
     "token", "型号", "日期", "商家", "ASN", "位置",
@@ -52,6 +66,13 @@ def ensure_dirs():
     JSON_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def configure_library_dir(path):
+    global REPORTS_DIR, JSON_DIR, CSV_PATH
+    REPORTS_DIR = Path(path)
+    JSON_DIR = REPORTS_DIR / "json"
+    CSV_PATH = REPORTS_DIR / "reports.csv"
+
+
 def init_csv():
     if not CSV_PATH.exists():
         with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
@@ -68,6 +89,46 @@ def token_exists(token):
             if row.get("token") == token:
                 return True
     return False
+
+
+def remove_token_from_csv(token):
+    if not CSV_PATH.exists():
+        return
+    with open(CSV_PATH, "r", encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    rows = [row for row in rows if row.get("token") != token]
+    with open(CSV_PATH, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def parse_monthly_usd(price_raw):
+    if not price_raw:
+        return None
+    price = extract_price_amount(price_raw)
+    if not price:
+        return None
+    amount, currency = price
+    if re.search(r"年付|年缴|年费|annual|annually|yearly|/年|/yr|/year", price_raw, re.IGNORECASE):
+        amount = amount / 12
+    return round(amount * APPROX_USD_RATES[currency], 2)
+
+
+def extract_price_amount(price_raw):
+    patterns = [
+        ("HKD", r"(?:HK\$|HKD)\s*([0-9]+(?:\.[0-9]+)?)"),
+        ("EUR", r"(?:€|EUR)\s*([0-9]+(?:\.[0-9]+)?)"),
+        ("CNY", r"(?:￥|¥|CNY|RMB)\s*([0-9]+(?:\.[0-9]+)?)"),
+        ("CNY", r"([0-9]+(?:\.[0-9]+)?)\s*(?:元|CNY|RMB)"),
+        ("USD", r"(?:USD|US\$)\s*([0-9]+(?:\.[0-9]+)?)"),
+        ("USD", r"(?<!HK)\$\s*([0-9]+(?:\.[0-9]+)?)"),
+    ]
+    for currency, pattern in patterns:
+        m = re.search(pattern, price_raw, re.IGNORECASE)
+        if m:
+            return float(m.group(1)), currency
+    return None
 
 
 def safe_get(d, *keys, default=""):
@@ -97,6 +158,8 @@ def extract_row(data, model, price_raw):
     pi = grades.get("price_info", {})
     if pi and pi.get("monthly_usd") is not None:
         price_monthly = pi["monthly_usd"]
+    elif price_raw:
+        price_monthly = parse_monthly_usd(price_raw)
     if price_raw:
         price_note = price_raw
 
@@ -124,20 +187,24 @@ def extract_row(data, model, price_raw):
     mobile_grade, mobile_best = _route_grade("移动")
 
     # Domestic speed
-    dl_cn = [s.get("download_mbps", 0) or 0 for s in speedtests]
+    dl_cn = [s.get("receive_mbps", s.get("download_mbps", 0)) or 0 for s in speedtests]
     avg_dl_cn = round(sum(dl_cn) / len(dl_cn), 1) if dl_cn else 0
 
     # International speed
-    dl_intl = [s.get("download_mbps", 0) or 0 for s in intl]
+    dl_intl = [s.get("receive_mbps", s.get("download_mbps", 0)) or 0 for s in intl]
     avg_dl_intl = round(sum(dl_intl) / len(dl_intl), 1) if dl_intl else 0
 
     # Retransmit
-    retrans_all = [s.get("retransmits", 0) or 0 for s in speedtests]
+    retrans_all = []
+    for item in intl:
+        for key in ("retransmit_send", "retransmit_recv"):
+            value = item.get(key)
+            if value is not None:
+                retrans_all.append(value)
     retrans_worst = max(retrans_all) if retrans_all else 0
     retrans_grade = safe_get(grades, "retransmit", "grade")
 
     # Report date
-    raw_date = meta.get("result", "")[:50]  # not reliable, use file mtime
     date_str = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     return {
@@ -222,13 +289,15 @@ def list_reports():
     print(f"\n共 {len(rows)} 份报告。JSON 归档: {JSON_DIR}/")
 
 
-def fetch_report(url, skip_ipv6=False):
+def fetch_report(url, skip_ipv6=False, price=""):
     """Run the parser and return JSON dict."""
     cmd = [sys.executable, str(PARSER), "--json"]
     if skip_ipv6:
         cmd.append("--skip-ipv6")
+    if price:
+        cmd.extend(["--price", price])
     cmd.append(url)
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
         print(f"❌ 解析失败:\n{r.stderr}", file=sys.stderr)
         sys.exit(1)
@@ -244,9 +313,11 @@ def main():
     parser.add_argument("--force", "-f", action="store_true", help="覆盖已存在的报告")
     parser.add_argument("--list", "-l", action="store_true", help="列出已存报告")
     parser.add_argument("--stdin", action="store_true", help="从 stdin 读取 JSON（管道模式）")
+    parser.add_argument("--library-dir", default="vps-reports", help="报告库目录（默认：vps-reports）")
 
     args = parser.parse_args()
 
+    configure_library_dir(args.library_dir)
     ensure_dirs()
 
     if args.list:
@@ -264,7 +335,7 @@ def main():
             sys.exit(1)
     elif args.url:
         # Direct mode: fetch via parser
-        data = fetch_report(args.url, skip_ipv6=args.skip_ipv6)
+        data = fetch_report(args.url, skip_ipv6=args.skip_ipv6, price=args.price)
     else:
         print("用法: 管道 JSON 或提供 URL\n  python parse_report.py --json URL | python save_report.py --model KVM-2G", file=sys.stderr)
         sys.exit(1)
@@ -278,6 +349,8 @@ def main():
     if token_exists(token) and not args.force:
         print(f"⏭️  报告 {token} 已存在，跳过。用 --force 覆盖。")
         return
+    if args.force:
+        remove_token_from_csv(token)
 
     if not args.model:
         print("⚠️  未指定 --model（型号），CSV 中型号列将留空。")

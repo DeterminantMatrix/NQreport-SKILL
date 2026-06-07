@@ -24,6 +24,7 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -45,6 +46,12 @@ USER_AGENT = (
 DEFAULT_CACHE_DIR = "./.nodequality-cache"
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 TOKEN_RE = re.compile(r"(?:/r/)?([A-Za-z0-9_-]{16,})")
+APPROX_USD_RATES = {
+    "USD": 1.0,
+    "CNY": 0.14,
+    "EUR": 1.08,
+    "HKD": 0.128,
+}
 
 # ---------------------------------------------------------------------------
 # Cache layer
@@ -193,6 +200,38 @@ def decode_entries(record):
     return data, entries
 
 
+def public_meta(data, fallback_token=""):
+    """Return metadata suitable for user output, excluding the large result blob."""
+    meta = {k: v for k, v in data.items() if k != "result"}
+    meta["token"] = meta.get("token") or fallback_token
+    return meta
+
+
+def load_json_objects(text):
+    """Load one or more concatenated JSON documents."""
+    if not text:
+        return []
+    decoder = json.JSONDecoder()
+    pos = 0
+    objects = []
+    while pos < len(text):
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if pos >= len(text):
+            break
+        obj, end = decoder.raw_decode(text, pos)
+        objects.append(obj)
+        pos = end
+    return objects
+
+
+def entry_json_objects(entries, name):
+    try:
+        return load_json_objects(entries.get(name, ""))
+    except json.JSONDecodeError:
+        return []
+
+
 def parse_hardware(log):
     mem_str = extract_labeled_value(log, "内存")
     disk_str = extract_labeled_value(log, "硬盘")
@@ -212,8 +251,66 @@ def parse_hardware(log):
     }
 
 
+def parse_hardware_json(obj):
+    if not obj:
+        return {}
+    os_info = obj.get("OS", {})
+    cpu = obj.get("CPU", {})
+    memory = obj.get("Memory", {})
+    disk = obj.get("Disk", {})
+    benchmark = obj.get("Benchmark", {})
+
+    virt = os_info.get("virtualization", {})
+    virt_type = virt.get("type") or ""
+    virt_kind = virt.get("kind") or ""
+    virt_label = " ".join(x for x in [virt_type.upper(), virt_kind] if x).strip()
+
+    os_label = " ".join(
+        x for x in [os_info.get("name"), os_info.get("kernel")] if x
+    ).strip()
+    cpu_label = " ".join(
+        x for x in [cpu.get("model"), f"步进{cpu.get('stepping')}" if cpu.get("stepping") else "", cpu.get("op_mode")] if x
+    ).strip()
+
+    mem_summary = memory.get("summary", {})
+    mem_raw = ""
+    if mem_summary:
+        mem_raw = (
+            f"总容量 {mem_summary.get('total', '')},  已用 {mem_summary.get('used', '')}"
+            f"({mem_summary.get('used_percent', '')}%),  可用 {mem_summary.get('available', '')}"
+            f"({mem_summary.get('avail_percent', '')}%)"
+        )
+
+    disk_summary = disk.get("summary", {})
+    disk_gb = None
+    disk_raw = ""
+    if disk_summary.get("total_bytes") is not None:
+        disk_gb = round(float(disk_summary["total_bytes"]) / (1024 ** 3), 1)
+        used_gb = round(float(disk_summary.get("used_bytes", 0)) / (1024 ** 3), 1)
+        avail_gb = round(float(disk_summary.get("avail_bytes", 0)) / (1024 ** 3), 1)
+        disk_raw = (
+            f"总容量 {disk_gb:g}G,  已用容量 {used_gb:g}G"
+            f"({disk_summary.get('used_percent', '')}%),  可用容量 {avail_gb:g}G"
+            f"({disk_summary.get('avail_percent', '')}%)"
+        )
+
+    gb5 = cpu.get("benchmarks", {}).get("geekbench5", {})
+    return {
+        "os": os_label,
+        "virt": virt_label,
+        "cpu": cpu_label,
+        "gb5_single": str(gb5.get("single") or ""),
+        "gb5_multi": str(gb5.get("multi") or ""),
+        "memory_raw": mem_raw,
+        "memory_gb": _parse_memory_gb(mem_summary.get("total", "")),
+        "disk_raw": disk_raw,
+        "disk_gb": disk_gb,
+        "score": str(benchmark.get("total") or ""),
+    }
+
+
 def _parse_memory_gb(text):
-    m = re.search(r"总容量\s*([0-9.]+)\s*(MB|GB|TB|mb|gb|tb)?", text, re.IGNORECASE)
+    m = re.search(r"(?:总容量\s*)?([0-9.]+)\s*(MB|GB|TB|mb|gb|tb)", text, re.IGNORECASE)
     if not m:
         return None
     val = float(m.group(1))
@@ -286,32 +383,161 @@ def parse_ip_quality(log):
     return {"ipv4": ipv4, "ipv6": ipv6}
 
 
+def parse_ip_quality_json(objects):
+    result = {"ipv4": {}, "ipv6": {}}
+    if not objects:
+        return result
+
+    provider_names = {
+        "IP2LOCATION": "IP2Location",
+        "SCAMALYTICS": "Scamalytics",
+        "ipapi": "ipapi",
+        "AbuseIPDB": "AbuseIPDB",
+        "IPQS": "IPQS",
+        "DBIP": "DB-IP",
+    }
+    media_names = {
+        "TikTok": "TikTok",
+        "DisneyPlus": "Disney+",
+        "Netflix": "Netflix",
+        "Youtube": "Youtube",
+        "AmazonPrimeVideo": "AmazonPV",
+        "Reddit": "Reddit",
+        "ChatGPT": "ChatGPT",
+    }
+
+    for obj in objects:
+        head_ip = str(obj.get("Head", {}).get("IP", ""))
+        target = result["ipv6"] if ":" in head_ip else result["ipv4"]
+        info = obj.get("Info", {})
+        city = info.get("City", {}) if isinstance(info.get("City"), dict) else {}
+        city_parts = [
+            x for x in [city.get("Name"), city.get("PostalCode"), city.get("SubCode")] if x and x != "null"
+        ]
+        target["org"] = info.get("Organization", "")
+        target["city"] = ", ".join(city_parts) or city.get("Subdivisions", "")
+        target["ip_type"] = info.get("Type", "")
+
+        dnsbl = obj.get("Mail", {}).get("DNSBlacklist", {})
+        if dnsbl:
+            target["bl_valid"] = int(dnsbl.get("Total") or 0)
+            target["bl_normal"] = int(dnsbl.get("Clean") or 0)
+            target["bl_marked"] = int(dnsbl.get("Marked") or 0)
+            target["bl_blacklist"] = int(dnsbl.get("Blacklisted") or 0)
+            target["blacklist"] = (
+                f"IP地址黑名单数据库：  有效 {target['bl_valid']}   正常 {target['bl_normal']}   "
+                f"已标记 {target['bl_marked']}   黑名单 {target['bl_blacklist']}"
+            )
+
+        scores = obj.get("Score", {})
+        factors = obj.get("Factor", {})
+        risks = []
+        risk_scores = {}
+        for raw_name, display_name in provider_names.items():
+            score = scores.get(raw_name)
+            factor_warn = any(
+                factors.get(kind, {}).get(raw_name) is True
+                for kind in ["Proxy", "Tor", "VPN", "Abuser", "Robot"]
+                if isinstance(factors.get(kind), dict)
+            )
+            if score in (None, "null", "") and not factor_warn:
+                continue
+            score_text = "" if score in (None, "null") else str(score)
+            if factor_warn:
+                risks.append(f"{display_name}：{score_text}|存在风险")
+                risk_scores[display_name] = "warn"
+                continue
+            low = _risk_score_is_low(raw_name, score_text)
+            risks.append(f"{display_name}：{score_text}|{'低风险' if low else '存在风险'}")
+            risk_scores[display_name] = "low" if low else "warn"
+        target["risks"] = risks
+        target["risk_scores"] = risk_scores
+
+        unlock_parsed = {}
+        for raw_name, display_name in media_names.items():
+            media = obj.get("Media", {}).get(raw_name, {})
+            unlock_parsed[display_name] = {
+                "status": clean(str(media.get("Status", ""))),
+                "region": clean(str(media.get("Region", ""))),
+                "method": clean(str(media.get("Type", ""))),
+            }
+        target["unlock_parsed"] = unlock_parsed
+        target["unlock"] = _format_unlock_lines(unlock_parsed)
+    return result
+
+
+def _risk_score_is_low(provider, score_text):
+    try:
+        value = float(score_text.rstrip("%"))
+    except (TypeError, ValueError):
+        return "低风险" in str(score_text) or score_text in ("", "0")
+    if provider == "SCAMALYTICS":
+        return value < 30
+    if provider == "ipapi":
+        return value < 1
+    return value <= 10
+
+
+def _format_unlock_lines(unlock_parsed):
+    if not unlock_parsed:
+        return []
+    services = list(unlock_parsed.keys())
+    return [
+        "服务商：  " + "  ".join(services),
+        "状态：    " + "  ".join(unlock_parsed[s].get("status", "") for s in services),
+        "地区：    " + "  ".join(f"[{unlock_parsed[s].get('region', '')}]" if unlock_parsed[s].get("region") else "" for s in services),
+        "方式：    " + "  ".join(unlock_parsed[s].get("method", "") for s in services),
+    ]
+
+
 def _parse_unlock_table(lines):
     """Try to parse the structured unlock table into dict."""
-    # The format is typically:
-    # 服务商： TikTok Disney+ Netflix ...
-    # 状态：   失败   解锁    解锁   ...
-    # 地区：          [CA]    [CA]  ...
-    # 方式：          原生    原生   ...
     if not lines:
         return {}
-    services = []
-    statuses = []
-    regions = []
-    methods = []
+    service_line = ""
+    status_line = ""
+    region_line = ""
+    method_line = ""
     for line in lines:
-        stripped = re.sub(r"\s+", " ", line)
+        stripped = line.strip()
         if stripped.startswith("服务商"):
-            services = [s.strip() for s in stripped.replace("服务商：", "").replace("服务商:", "").split()]
+            service_line = line
         elif stripped.startswith("状态"):
-            statuses = [s.strip() for s in stripped.replace("状态：", "").replace("状态:", "").split()]
+            status_line = line
         elif stripped.startswith("地区"):
-            regions_raw = re.findall(r"\[([^\]]*)\]", stripped)
-            regions = regions_raw
+            region_line = line
         elif stripped.startswith("方式"):
-            methods = [s.strip() for s in stripped.replace("方式：", "").replace("方式:", "").split()]
+            method_line = line
+
+    if not service_line:
+        return {}
+
+    label_match = re.search(r"服务商[：:]\s*", service_line)
+    content_start = label_match.end() if label_match else 0
+    services = [
+        (m.group(0), content_start + m.start())
+        for m in re.finditer(r"\S+", service_line[content_start:])
+    ]
+
+    def cells_for(row, region=False):
+        values = []
+        for idx, (_, start) in enumerate(services):
+            end = services[idx + 1][1] if idx + 1 < len(services) else len(row)
+            cell = row[start:end].strip() if start < len(row) else ""
+            if region:
+                m = re.search(r"\[([^\]]*)\]", cell)
+                values.append(m.group(1) if m else "")
+            else:
+                values.append(cell.split()[0] if cell.split() else "")
+        return values
+
+    status_match = re.search(r"状态[：:]\s*(.*)", status_line)
+    statuses = status_match.group(1).split() if status_match else []
+    regions = cells_for(region_line, region=True)
+    methods = cells_for(method_line)
+
     result = {}
-    for i, svc in enumerate(services):
+    for i, (svc, _) in enumerate(services):
         result[svc] = {
             "status": statuses[i] if i < len(statuses) else "",
             "region": regions[i] if i < len(regions) else "",
@@ -334,18 +560,61 @@ def parse_speedtest(log):
             for part in parts:
                 if not part:
                     continue
-                # Format: "节点名  下载  上传  重传  延迟" or similar
+                # NodeQuality domestic format:
+                #   节点  发送(Mbps)  发送延迟(ms)  接收(Mbps)  接收延迟(ms)
                 tokens = part.split()
                 if len(tokens) >= 3:
+                    send_mbps = _parse_int(tokens[1]) if len(tokens) > 1 else None
+                    send_latency = _parse_int(tokens[2]) if len(tokens) > 2 else None
+                    receive_mbps = _parse_int(tokens[3]) if len(tokens) > 3 else None
+                    receive_latency = _parse_int(tokens[4]) if len(tokens) > 4 else None
                     entry = {
                         "raw": part,
                         "node": tokens[0],
-                        "download_mbps": _parse_int(tokens[1]) if len(tokens) > 1 else None,
-                        "upload_mbps": _parse_int(tokens[2]) if len(tokens) > 2 else None,
-                        "retransmits": _parse_int(tokens[3]) if len(tokens) > 3 else None,
-                        "latency_ms": _parse_int(tokens[4]) if len(tokens) > 4 else None,
+                        "send_mbps": send_mbps,
+                        "send_latency_ms": send_latency,
+                        "receive_mbps": receive_mbps,
+                        "receive_latency_ms": receive_latency,
+                        # Backward-compatible aliases. For China-facing use, the
+                        # receive column is the useful downstream throughput.
+                        "upload_mbps": send_mbps,
+                        "download_mbps": receive_mbps,
+                        "latency_ms": receive_latency,
+                        "retransmits": None,
                     }
                     results.append(entry)
+    return results
+
+
+def parse_speedtest_json(objects, fallback_log=""):
+    if not objects:
+        return parse_speedtest(fallback_log)
+    obj = objects[0]
+    results = []
+    for item in obj.get("Speedtest", []) or []:
+        node = f"{item.get('City', '')}{item.get('Provider', '')}".strip()
+        send_mbps = _bps_to_mbps(item.get("SendSpeed"))
+        receive_mbps = _bps_to_mbps(item.get("ReceiveSpeed"))
+        entry = {
+            "raw": node,
+            "node": node,
+            "send_mbps": send_mbps,
+            "send_latency_ms": _parse_int(str(item.get("SendDelay", ""))),
+            "receive_mbps": receive_mbps,
+            "receive_latency_ms": _parse_int(str(item.get("ReceiveDelay", ""))),
+            "upload_mbps": send_mbps,
+            "download_mbps": receive_mbps,
+            "latency_ms": _parse_int(str(item.get("ReceiveDelay", ""))),
+            "retransmits": None,
+        }
+        results.append(entry)
+
+    # JSON omits failed domestic speedtest rows. Keep those from the log so the
+    # user still sees mobile/region failures.
+    existing_nodes = {r["node"] for r in results}
+    for item in parse_speedtest(fallback_log):
+        if item["node"] not in existing_nodes:
+            results.append(item)
     return results
 
 
@@ -374,19 +643,59 @@ def parse_international(log):
                 tokens = cleaned.split()
                 if len(tokens) >= 3:
                     # NodeQuality international format:
-                    #   城市  延迟(ms)  下载(Mbps)  重传(发)  上传(Mbps)  重传(收)
+                    #   城市  延迟(ms)  发送(Mbps)  重传(发)  接收(Mbps)  重传(收)
+                    send_mbps = _parse_int(tokens[2]) if len(tokens) > 2 else None
+                    retransmit_send = _parse_int(tokens[3]) if len(tokens) > 3 else None
+                    receive_mbps = _parse_int(tokens[4]) if len(tokens) > 4 else None
+                    retransmit_recv = _parse_int(tokens[5]) if len(tokens) > 5 else None
                     entry = {
                         "raw": part,
                         "city": tokens[0],
                         "latency_ms": _parse_int(tokens[1]) if len(tokens) > 1 else None,
-                        "download_mbps": _parse_int(tokens[2]) if len(tokens) > 2 else None,
-                        "retransmit_send": _parse_int(tokens[3]) if len(tokens) > 3 else None,
-                        "upload_mbps": _parse_int(tokens[4]) if len(tokens) > 4 else None,
-                        "retransmit_recv": _parse_int(tokens[5]) if len(tokens) > 5 else None,
+                        "send_mbps": send_mbps,
+                        "retransmit_send": retransmit_send,
+                        "receive_mbps": receive_mbps,
+                        "retransmit_recv": retransmit_recv,
+                        # Backward-compatible aliases.
+                        "upload_mbps": send_mbps,
+                        "download_mbps": receive_mbps,
                     }
                     results.append(entry)
         break
     return results
+
+
+def parse_international_json(objects, fallback_log=""):
+    if not objects:
+        return parse_international(fallback_log)
+    obj = objects[0]
+    results = []
+    for item in obj.get("Transfer", []) or []:
+        send_mbps = _bps_to_mbps(item.get("SendSpeed"))
+        receive_mbps = _bps_to_mbps(item.get("ReceiveSpeed"))
+        delay = item.get("Delay", {})
+        entry = {
+            "raw": item.get("City", ""),
+            "city": item.get("City", ""),
+            "latency_ms": _parse_int(str(delay.get("Average", ""))) if isinstance(delay, dict) else None,
+            "send_mbps": send_mbps,
+            "retransmit_send": _parse_int(str(item.get("SendRetransmits", ""))),
+            "receive_mbps": receive_mbps,
+            "retransmit_recv": _parse_int(str(item.get("ReceiveRetransmits", ""))),
+            "upload_mbps": send_mbps,
+            "download_mbps": receive_mbps,
+        }
+        results.append(entry)
+    return results or parse_international(fallback_log)
+
+
+def _bps_to_mbps(value):
+    if value in (None, "", "null"):
+        return None
+    try:
+        return int(round(float(value) / 1_000_000))
+    except (TypeError, ValueError):
+        return _parse_int(str(value))
 
 
 def _parse_int(s):
@@ -396,6 +705,9 @@ def _parse_int(s):
     s = s.strip()
     if s.upper() == "ERROR":
         return None
+    k_match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*[kK]", s)
+    if k_match:
+        return int(float(k_match.group(1)) * 1000)
     try:
         return int(s)
     except ValueError:
@@ -405,16 +717,21 @@ def _parse_int(s):
 def parse_route_matrix(net_log):
     """Parse the TCP/UDP return route summary lines."""
     matrix = []
+    route_block = 0
     for line in net_log.splitlines():
+        if "三网回程路由" in line:
+            route_block += 1
+            continue
         if re.search(r"(北京|上海|广州)(TCP|UDP)", line):
             line = re.sub(r"\s+", " ", line).strip()
+            ip_version = "ipv4" if route_block == 1 else "ipv6" if route_block == 2 else ""
             # Parse structured
             parts = line.split("：")
             if len(parts) >= 2:
                 direction = parts[0].strip()
                 detail = parts[1].strip()
                 carriers = detail.split("||")
-                parsed = {"direction": direction, "routes": {}}
+                parsed = {"direction": direction, "routes": {}, "ip_version": ip_version}
                 for c in carriers:
                     c = c.strip()
                     cm = re.match(r"(电信|联通|移动)\s+(.+)", c)
@@ -422,7 +739,7 @@ def parse_route_matrix(net_log):
                         parsed["routes"][cm.group(1)] = cm.group(2).strip()
                 matrix.append(parsed)
             else:
-                matrix.append({"direction": line, "routes": {}})
+                matrix.append({"direction": line, "routes": {}, "ip_version": ip_version})
     return matrix
 
 
@@ -614,12 +931,15 @@ def grade_route(route_matrix, carrier, focus_routes=None):
     if not route_matrix:
         return {"grade": "?", "score": 0, "label": "无数据", "details": [], "best_route": ""}
 
+    ipv4_entries = [entry for entry in route_matrix if entry.get("ip_version") != "ipv6"]
+    entries_for_grade = ipv4_entries or route_matrix
+
     best_grade = "?"
     best_score = 0
     best_detail = ""
     all_details = []
 
-    for entry in route_matrix:
+    for entry in entries_for_grade:
         routes = entry.get("routes", {})
         route_str = routes.get(carrier, "")
         if not route_str:
@@ -702,14 +1022,14 @@ def grade_speedtest_download(mbps):
 
 
 def grade_international(results):
-    """Grade international bandwidth. Average download across regions."""
+    """Grade international bandwidth. Average receive throughput across regions."""
     if not results:
         return {"grade": "?", "score": 0, "label": "无数据", "details": []}
-    downloads = [r.get("download_mbps") for r in results if r.get("download_mbps") is not None]
-    if not downloads:
+    receives = [r.get("receive_mbps") for r in results if r.get("receive_mbps") is not None]
+    if not receives:
         return {"grade": "?", "score": 0, "label": "无数据", "details": []}
 
-    avg = sum(downloads) / len(downloads)
+    avg = sum(receives) / len(receives)
     if avg >= 1000:
         grade, score = "S", 93
     elif avg >= 500:
@@ -726,7 +1046,7 @@ def grade_international(results):
         "score": score,
         "label": GRADE_LABELS.get(grade, "?"),
         "avg_mbps": round(avg, 1),
-        "details": [f"{r['city']} {r.get('download_mbps','?')}Mbps" for r in results[:10]],
+        "details": [f"{r['city']} 接收 {r.get('receive_mbps','?')}Mbps" for r in results[:10]],
     }
 
 
@@ -753,16 +1073,54 @@ def grade_unlock(unlock_parsed):
 def parse_price(price_str):
     """Try to extract monthly cost in USD from a free-form price string."""
     if not price_str:
-        return {"raw": "", "monthly_usd": None, "note": ""}
-    # Try to find $XX.XX/月 or $XX/月
-    m = re.search(r'\$([0-9]+(?:\.[0-9]+)?)\s*/?\s*月', price_str)
-    if m:
-        return {"raw": price_str, "monthly_usd": float(m.group(1)), "note": ""}
-    # Try just $XX.XX
-    m = re.search(r'\$([0-9]+(?:\.[0-9]+)?)', price_str)
-    if m:
-        return {"raw": price_str, "monthly_usd": float(m.group(1)), "note": "（从价格字符串提取，可能不含周期）"}
-    return {"raw": price_str, "monthly_usd": None, "note": "无法解析月费"}
+        return {"raw": "", "monthly_usd": None, "note": "", "currency": "", "monthly_native": None}
+
+    price = _extract_price_amount(price_str)
+    if not price:
+        return {"raw": price_str, "monthly_usd": None, "note": "无法解析月费", "currency": "", "monthly_native": None}
+
+    amount, currency = price
+    period = _price_period(price_str)
+    monthly_native = round(amount / 12, 2) if period == "annual" else amount
+    monthly_usd = round(monthly_native * APPROX_USD_RATES[currency], 2)
+    notes = []
+    if period == "annual":
+        notes.append("按年付价格折算月费")
+    elif period == "unknown":
+        notes.append("从价格字符串提取，可能不含周期")
+    if currency != "USD":
+        notes.append(f"按近似汇率换算：1 {currency}≈${APPROX_USD_RATES[currency]}")
+    return {
+        "raw": price_str,
+        "monthly_usd": monthly_usd,
+        "currency": currency,
+        "monthly_native": monthly_native,
+        "note": f"（{'；'.join(notes)}）" if notes else "",
+    }
+
+
+def _price_period(price_str):
+    if re.search(r"年付|年缴|年费|annual|annually|yearly|/年|/yr|/year", price_str, re.IGNORECASE):
+        return "annual"
+    if re.search(r"月|/mo|/month|monthly", price_str, re.IGNORECASE):
+        return "monthly"
+    return "unknown"
+
+
+def _extract_price_amount(price_str):
+    patterns = [
+        ("HKD", r"(?:HK\$|HKD)\s*([0-9]+(?:\.[0-9]+)?)"),
+        ("EUR", r"(?:€|EUR)\s*([0-9]+(?:\.[0-9]+)?)"),
+        ("CNY", r"(?:￥|¥|CNY|RMB)\s*([0-9]+(?:\.[0-9]+)?)"),
+        ("CNY", r"([0-9]+(?:\.[0-9]+)?)\s*(?:元|CNY|RMB)"),
+        ("USD", r"(?:USD|US\$)\s*([0-9]+(?:\.[0-9]+)?)"),
+        ("USD", r"(?<!HK)\$\s*([0-9]+(?:\.[0-9]+)?)"),
+    ]
+    for currency, pattern in patterns:
+        m = re.search(pattern, price_str, re.IGNORECASE)
+        if m:
+            return float(m.group(1)), currency
+    return None
 
 
 def calculate_cost_performance(overall_score, price_info):
@@ -808,19 +1166,25 @@ def grade_all(parsed, focus_routes=None, price_str=None):
     for carrier in ["电信", "联通", "移动"]:
         grades[f"route_{carrier}"] = grade_route(route_matrix, carrier, focus_routes)
 
-    # Retransmit analysis
+    # Speed and retransmit analysis. Domestic speed rows do not contain
+    # retransmit counts; international rows do.
     speedtests = parsed.get("speedtests", [])
+    international = parsed.get("international", [])
     retrans_grades = []
     speed_grades = []
     for st in speedtests:
-        r = st.get("retransmits")
-        if r is not None:
-            g, s, l = grade_retransmit(r)
-            retrans_grades.append((g, s, f"{st['node']}: {l}"))
-        dl = st.get("download_mbps")
+        dl = st.get("receive_mbps")
         if dl is not None:
             g, s, l = grade_speedtest_download(dl)
-            speed_grades.append((g, s, f"{st['node']}: {l}"))
+            speed_grades.append((g, s, f"{st['node']}: 接收 {l}"))
+
+    for item in international:
+        city = item.get("city", "?")
+        for key, label in [("retransmit_send", "发"), ("retransmit_recv", "收")]:
+            r = item.get(key)
+            if r is not None:
+                g, s, l = grade_retransmit(r)
+                retrans_grades.append((g, s, f"{city}{label}: {r} {l}"))
 
     if retrans_grades:
         worst = min(retrans_grades, key=lambda x: x[1])
@@ -844,7 +1208,7 @@ def grade_all(parsed, focus_routes=None, price_str=None):
     else:
         grades["domestic_speed"] = {"grade": "?", "score": 0, "label": "无数据", "details": []}
 
-    grades["international"] = grade_international(parsed.get("international", []))
+    grades["international"] = grade_international(international)
 
     unlock = parsed["ip_quality"].get("ipv4", {}).get("unlock_parsed", {})
     grades["unlock"] = grade_unlock(unlock)
@@ -907,15 +1271,19 @@ def _all_transit(routes_dict):
 def visualize_routes(route_matrix, focus_routes=None):
     """
     Group routes by carrier and protocol, separating IPv4 and IPv6.
-    NodeQuality prints two route matrix blocks: IPv4 (premium/optimized) then IPv6 (HE/transit).
-    We detect the split by checking whether ALL carriers in an entry use transit.
+    NodeQuality prints two route matrix blocks: IPv4 then IPv6. parse_route_matrix()
+    tags those blocks with ip_version; old or malformed logs fall back to transit hints.
     """
-    # First pass: group entries into IPv4 and IPv6 blocks
     v4_entries = []
     v6_entries = []
     for entry in route_matrix:
         routes = entry.get("routes", {})
-        if _all_transit(routes):
+        ip_version = entry.get("ip_version")
+        if ip_version == "ipv6":
+            v6_entries.append(entry)
+        elif ip_version == "ipv4":
+            v4_entries.append(entry)
+        elif _all_transit(routes):
             v6_entries.append(entry)
         else:
             v4_entries.append(entry)
@@ -980,6 +1348,12 @@ def _focus_match(route_name, focus_routes):
     return False
 
 
+def _fmt_score(value):
+    if isinstance(value, float):
+        return f"{value:.1f}"
+    return str(value)
+
+
 def _is_ipv6_evidence(item):
     """Detect whether a route evidence entry is IPv6 (HE transit).
     IPv6 entries typically have:
@@ -1029,7 +1403,7 @@ def format_markdown_single(meta, parsed, grades, focus_routes=None, skip_ipv6=Fa
     ov = grades.get("overall", {})
     ov_grade = ov.get("grade", "?")
     ov_score = ov.get("score", 0)
-    lines.append(f"## 综合评级: **{ov_grade}** ({ov_score} 分)")
+    lines.append(f"## 综合评级: **{ov_grade}** ({_fmt_score(ov_score)} 分)")
     lines.append("")
 
     # Grade summary table
@@ -1052,7 +1426,7 @@ def format_markdown_single(meta, parsed, grades, focus_routes=None, skip_ipv6=Fa
     for key, label in dim_order:
         g = grades.get(key, {})
         grade_str = g.get("grade", "?")
-        score_str = g.get("score", 0)
+        score_str = _fmt_score(g.get("score", 0))
         label_str = g.get("label", "")
         # Highlight focus routes
         marker = ""
@@ -1146,17 +1520,17 @@ def format_markdown_single(meta, parsed, grades, focus_routes=None, skip_ipv6=Fa
     lines.append("## 国内测速")
     speedtests = parsed.get("speedtests", [])
     if speedtests:
-        lines.append("| 节点 | 下载 | 上传 | 重传 | 重传评级 |")
-        lines.append("| --- | --- | --- | --- | --- |")
+        lines.append("| 节点 | 发送 | 发送延迟 | 接收 | 接收延迟 | 接收评级 |")
+        lines.append("| --- | --- | --- | --- | --- | --- |")
         for st in speedtests[:10]:
-            r = st.get("retransmits")
-            rg, _, rl = grade_retransmit(r)
             node = st.get("node", "?")
-            dl = f"{st['download_mbps']}Mbps" if st.get("download_mbps") is not None else "ERROR"
-            ul = f"{st['upload_mbps']}Mbps" if st.get("upload_mbps") is not None else "ERROR"
-            ret = str(r) if r is not None else "N/A"
+            send = f"{st['send_mbps']}Mbps" if st.get("send_mbps") is not None else "ERROR"
+            send_lat = f"{st['send_latency_ms']}ms" if st.get("send_latency_ms") is not None else "?"
+            recv = f"{st['receive_mbps']}Mbps" if st.get("receive_mbps") is not None else "ERROR"
+            recv_lat = f"{st['receive_latency_ms']}ms" if st.get("receive_latency_ms") is not None else "?"
+            rg, _, rl = grade_speedtest_download(st.get("receive_mbps"))
             focus_mark = " 🎯" if _focus_match(node, focus_routes) else ""
-            lines.append(f"| {node}{focus_mark} | {dl} | {ul} | {ret} | {rg} {rl} |")
+            lines.append(f"| {node}{focus_mark} | {send} | {send_lat} | {recv} | {recv_lat} | {rg} {rl} |")
     else:
         lines.append("无数据")
 
@@ -1165,15 +1539,16 @@ def format_markdown_single(meta, parsed, grades, focus_routes=None, skip_ipv6=Fa
     lines.append("## 国际带宽")
     intl = parsed.get("international", [])
     if intl:
-        lines.append("| 区域 | 下载 | 上传 | 延迟 | 重传(收) |")
+        lines.append("| 区域 | 发送 | 接收 | 延迟 | 重传(发/收) |")
         lines.append("| --- | --- | --- | --- | --- |")
         for item in intl[:12]:
             city = item.get("city", "?")
-            dl = f"{item['download_mbps']}Mbps" if item.get("download_mbps") is not None else "ERROR"
-            ul = f"{item['upload_mbps']}Mbps" if item.get("upload_mbps") is not None else "?"
+            send = f"{item['send_mbps']}Mbps" if item.get("send_mbps") is not None else "ERROR"
+            recv = f"{item['receive_mbps']}Mbps" if item.get("receive_mbps") is not None else "?"
             lat = f"{item['latency_ms']}ms" if item.get("latency_ms") is not None else "?"
-            retr = str(item.get("retransmit_recv", "?")) if item.get("retransmit_recv") is not None else "?"
-            lines.append(f"| {city} | {dl} | {ul} | {lat} | {retr} |")
+            retr_send = str(item.get("retransmit_send")) if item.get("retransmit_send") is not None else "?"
+            retr_recv = str(item.get("retransmit_recv")) if item.get("retransmit_recv") is not None else "?"
+            lines.append(f"| {city} | {send} | {recv} | {lat} | {retr_send}/{retr_recv} |")
     else:
         lines.append("无数据")
 
@@ -1237,7 +1612,7 @@ def format_markdown_compare(reports, focus_routes=None, skip_ipv6=False):
         ("机房", [(r["meta"].get("location") or {}).get("colo", "?") for r in reports]),
         ("ASN", [f"AS{r['meta'].get('asn','?')}" for r in reports]),
         ("价格", [r["grades"].get("price_info", {}).get("raw", "未提供") for r in reports]),
-        ("综合评级", [f"**{r['grades'].get('overall',{}).get('grade','?')}** ({r['grades'].get('overall',{}).get('score',0)}分)" for r in reports]),
+        ("综合评级", [f"**{r['grades'].get('overall',{}).get('grade','?')}** ({_fmt_score(r['grades'].get('overall',{}).get('score',0))}分)" for r in reports]),
     ]
     for label, vals in rows:
         lines.append(f"| {label} | " + " | ".join(str(v) for v in vals) + " |")
@@ -1265,7 +1640,7 @@ def format_markdown_compare(reports, focus_routes=None, skip_ipv6=False):
         for r in reports:
             g = r["grades"].get(key, {})
             grade_str = g.get("grade", "?")
-            score_str = g.get("score", 0)
+            score_str = _fmt_score(g.get("score", 0))
             vals.append(f"**{grade_str}** ({score_str})")
         focus_mark = ""
         if key.startswith("route_") and focus_routes:
@@ -1284,6 +1659,8 @@ def format_markdown_compare(reports, focus_routes=None, skip_ipv6=False):
             for i, r in enumerate(reports):
                 route_matrix = r["parsed"]["route_matrix"]
                 for entry in route_matrix:
+                    if skip_ipv6 and entry.get("ip_version") == "ipv6":
+                        continue
                     direction = entry.get("direction", "")
                     if fr.split("电信")[0].split("联通")[0].split("移动")[0].strip() in direction:
                         for carrier in ["电信", "联通", "移动"]:
@@ -1299,7 +1676,7 @@ def format_markdown_compare(reports, focus_routes=None, skip_ipv6=False):
     for rank, (i, score) in enumerate(overalls, 1):
         r = reports[i]
         grade = r["grades"].get("overall", {}).get("grade", "?")
-        lines.append(f"{rank}. **{names[i]}** — {grade} ({score} 分)")
+        lines.append(f"{rank}. **{names[i]}** — {grade} ({_fmt_score(score)} 分)")
 
     # Cost-performance winner
     cp_scores = [(i, r["grades"].get("cost_performance", {}).get("ratio", 0) or 0) for i, r in enumerate(reports)]
@@ -1333,15 +1710,18 @@ def format_json_output(reports, skip_ipv6=False):
             entry["ip_quality"] = {
                 k: v for k, v in entry["ip_quality"].items() if k == "ipv4"
             }
-            # Strip transit (IPv6) entries from route_matrix
+            entry["grades"] = {
+                k: v for k, v in entry["grades"].items() if k != "ipv6"
+            }
+            # Strip IPv6 entries from route_matrix.
             entry["route_matrix"] = [
                 rm for rm in entry["route_matrix"]
-                if not _all_transit(rm.get("routes", {}))
+                if rm.get("ip_version") != "ipv6"
             ]
         output.append(entry)
     if len(output) == 1:
-        return json.dumps(output[0], ensure_ascii=False, indent=2) + "\n"
-    return json.dumps(output, ensure_ascii=False, indent=2) + "\n"
+        return json.dumps(output[0], ensure_ascii=True, indent=2) + "\n"
+    return json.dumps(output, ensure_ascii=True, indent=2) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -1353,29 +1733,37 @@ def analyze_one(url_or_token, cache_dir=None, refresh=False, record_json=None):
     """Fetch + parse + grade a single report."""
     if record_json:
         record = json.loads(Path(record_json).read_text(encoding="utf-8"))
+        if "_record" in record:
+            record = record["_record"]
         token = "local"
-        meta = record.get("data", record)
     else:
         token, record = fetch_record(url_or_token, cache_dir=cache_dir, refresh=refresh)
-        if not record.get("success", True):
-            raise RuntimeError(record.get("message") or "NodeQuality API returned success=false")
-        meta = record.get("data", record)
 
+    if not record.get("success", True):
+        raise RuntimeError(record.get("message") or "NodeQuality API returned success=false")
     data, entries = decode_entries(record)
-    meta["token"] = meta.get("token", token)
+    meta = public_meta(data, token)
 
     # Parse all log files
     hw_log = clean(entries.get("hardware_quality.log", ""))
     ip_log = clean(entries.get("ip_quality.log", ""))
     net_log = clean(entries.get("net_quality.log", ""))
     backroute_log = clean(entries.get("backroute_trace.log", ""))
+    hw_json = entry_json_objects(entries, "hardware_quality.json")
+    ip_json = entry_json_objects(entries, "ip_quality.json")
+    net_json = entry_json_objects(entries, "net_quality.json")
+
+    hardware = parse_hardware_json(hw_json[0] if hw_json else {}) or parse_hardware(hw_log)
+    ip_quality = parse_ip_quality_json(ip_json)
+    if not ip_quality.get("ipv4") and not ip_quality.get("ipv6"):
+        ip_quality = parse_ip_quality(ip_log)
 
     parsed = {
         "entries": entries,
-        "hardware": parse_hardware(hw_log),
-        "ip_quality": parse_ip_quality(ip_log),
-        "speedtests": parse_speedtest(net_log),
-        "international": parse_international(net_log),
+        "hardware": hardware,
+        "ip_quality": ip_quality,
+        "speedtests": parse_speedtest_json(net_json, net_log),
+        "international": parse_international_json(net_json, net_log),
         "route_matrix": parse_route_matrix(net_log),
         "route_evidence": parse_route_evidence(backroute_log),
     }

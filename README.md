@@ -8,7 +8,7 @@
 - **单报告 & 多报告对比** — 单机分析或最多 N 台横向对比
 - **SABCD 字母评级** — 覆盖 9 个维度（硬件、IP 质量、三网回国、国内速度、国际带宽、流媒体解锁、性价比）
 - **路由可视化** — 运营商 × 协议矩阵，自动识别优质线路（CN2GIA / 9929 / CMIN2）
-- **价格感知** — `--price` 参数启用性价比评级
+- **价格感知** — `--price` 参数启用性价比评级，支持 USD/CNY/EUR/HKD 与月付/年付折算
 - **重点线路聚焦** — `--focus-routes` 指定运营商/城市深度分析
 - **IPv4 / IPv6 切换** — `--skip-ipv6` 跳过所有 IPv6 相关内容
 - **JSON 输出** — 管道友好的结构化输出
@@ -53,7 +53,7 @@ parse_nodequality_report.py [URL_OR_TOKEN ...] [选项]
 
 上下文:
   --focus-routes ROUTES  逗号分隔的重点线路，如 "上海电信,北京联通"
-  --price PRICE          价格信息（对比模式下可重复使用）
+  --price PRICE          价格信息（对比模式下可重复使用），如 "$5/mo"、"29元/月"、"$60/year"
   --skip-ipv6            跳过所有 IPv6 相关部分
 
 缓存:
@@ -75,8 +75,8 @@ parse_nodequality_report.py [URL_OR_TOKEN ...] [选项]
 | 电信回国 | CN2GIA > CN2 > 10099 > CMI > 4837 > 163 > HE |
 | 联通回国 | 10099/9929 > CMI > 4837 > 163 > HE |
 | 移动回国 | CMIN2 > CMI > 163 > HE |
-| 国内速度 | 到国内节点的下载速率 + 重传率 |
-| 国际带宽 | 到全球主要区域的跨境吞吐量 |
+| 国内速度 | 到国内节点的接收速率与延迟 |
+| 国际带宽 | 到全球主要区域的发送/接收吞吐量 + 重传 |
 | 流媒体解锁 | 流媒体 + AI（ChatGPT）解锁数量 |
 | 性价比 | 综合评分 ÷ 月付价格（需提供 `--price`） |
 
@@ -102,7 +102,7 @@ parse_nodequality_report.py [URL_OR_TOKEN ...] [选项]
 
 ## VPS 库（save_report.py）
 
-`save_report.py` 将解析后的报告保存到 `vps_library.json` + `vps_library.csv`：
+`save_report.py` 将解析后的报告保存到 `vps-reports/json/<token>.json` + `vps-reports/reports.csv`：
 
 ```bash
 # 管道模式（推荐）
@@ -110,6 +110,9 @@ python scripts/parse_nodequality_report.py --json "<url>" | python scripts/save_
 
 # 直接模式
 python scripts/save_report.py -m "KVM-2G" -p "$5/月" "<url>"
+
+# 指定报告库目录
+python scripts/save_report.py --library-dir "./my-vps-library" -m "KVM-2G" "<url>"
 
 # 列出已保存的报告
 python scripts/save_report.py --list
