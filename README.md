@@ -1,5 +1,6 @@
 # NQreport-SKILL
 
+> 欢迎根据各自需求修改。
 > 抓取、解码、评分、对比 [NodeQuality](https://nodequality.com) VPS 基准测试报告 — 面向人类和 AI 代理。
 
 ## 功能
