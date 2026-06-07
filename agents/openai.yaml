@@ -1,0 +1,4 @@
+interface:
+  display_name: "NodeQuality Report"
+  short_description: "Parse NodeQuality report URLs into VPS quality summaries."
+  default_prompt: "Use $nodequality-report to analyze this NodeQuality report URL."
