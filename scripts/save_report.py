@@ -3,11 +3,11 @@
 Save NodeQuality report to local VPS library (JSON + CSV).
 
 Usage:
-  # Pipe from parser (recommended)
-  python parse_nodequality_report.py --json "<url>" | python save_report.py --model "KVM-2G"
-
-  # Direct mode (calls parser internally)
+  # Direct mode: parses and saves JSON + CSV automatically
   python save_report.py --model "KVM-2G" --price "$5/mo" "https://nodequality.com/r/<token>"
+
+  # Optional stdin mode for pre-parsed JSON
+  python parse_nodequality_report.py --json "<url>" | python save_report.py --stdin --model "KVM-2G"
 
   # List saved reports
   python save_report.py --list
@@ -337,7 +337,7 @@ def main():
         # Direct mode: fetch via parser
         data = fetch_report(args.url, skip_ipv6=args.skip_ipv6, price=args.price)
     else:
-        print("用法: 管道 JSON 或提供 URL\n  python parse_report.py --json URL | python save_report.py --model KVM-2G", file=sys.stderr)
+        print("用法: 提供 URL 直接保存\n  python save_report.py --model KVM-2G --price '$5/mo' URL", file=sys.stderr)
         sys.exit(1)
 
     # --- Dedup check ---

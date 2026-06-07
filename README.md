@@ -1,6 +1,6 @@
 # NQreport-SKILL
 
-NQreport-SKILL 是 NodeQuality VPS 测试报告解析与评分工具，也可作为 Codex/AI 代理技能使用。它接受 `https://nodequality.com/r/<token>` 或 token，自动抓取、解码，并整理硬件、IP 质量、三网回国、测速、流媒体/AI 解锁、价格性价比等信息。
+NQreport-SKILL 是 NodeQuality VPS 测试报告解析与评分工具，也可作为 Codex/AI 代理技能使用。它接受 `https://nodequality.com/r/<token>` 或 token，自动抓取、解码，并整理厂商型号、硬件、IP 质量、三网回国、测速、流媒体/AI 解锁、价格性价比等信息。
 
 工具会生成 SABCD 评级，帮助判断 VPS 是否值得购买或续费；支持多报告横向对比、`--skip-ipv6`、`--json` 和本地缓存，适合在不同商家、型号和线路之间做取舍。
 
@@ -31,10 +31,10 @@ python scripts/parse_nodequality_report.py \
 python scripts/parse_nodequality_report.py "URL1" "URL2" "URL3"
 ```
 
-保存到本地库：
+保存到本地库时直接运行 `save_report.py`，它会自动解析并写入 JSON 和 CSV：
 
 ```bash
-python scripts/parse_nodequality_report.py --json "<url>" | python scripts/save_report.py -m "KVM-2G" -p "$5/mo"
+python scripts/save_report.py -m "KVM-2G" -p "$5/mo" "<url>"
 ```
 
 归档写入 `vps-reports/json/` 和 `vps-reports/reports.csv`，便于长期追踪价格和线路表现。

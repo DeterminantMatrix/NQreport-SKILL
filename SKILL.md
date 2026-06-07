@@ -9,19 +9,22 @@ description: Fetch, decode, and summarize NodeQuality report URLs or tokens. Sup
 
 ### Phase 1 — Collect Context (ALWAYS do this first)
 
-Before running the parser, ask the user THREE questions:
+Before running the parser, ask the user FOUR questions:
 
-1. **重点分析线路** — "请输入重点分析的线路（如：上海电信,北京联通），多个用逗号分隔。直接回车则默认分析所有线路："
+1. **厂商名称及型号** — "请输入厂商名称及型号（如：天翼云 2H4G HK、DMIT PVM.HKG.Pro）。直接回车则使用报告中的商家/地区信息："
 
-2. **价格信息** — "请输入价格信息（如：续费$5.99/月,二手溢价约$50）。直接回车则跳过性价比分析："
+2. **重点分析线路** — "请输入重点分析的线路（如：上海电信,北京联通），多个用逗号分隔。直接回车则默认分析所有线路："
 
-3. **IPv6 分析** — "是否需要分析 IPv6？（直接回车默认分析，输入 n/no/skip 跳过 IPv6 相关部分）："
+3. **价格信息** — "请输入价格信息（如：续费$5.99/月,二手溢价约$50）。直接回车则跳过性价比分析："
+
+4. **IPv6 分析** — "是否需要分析 IPv6？（直接回车默认分析，输入 n/no/skip 跳过 IPv6 相关部分）："
    - If user says no → pass `--skip-ipv6` to the parser.
    - If user says yes or just hits Enter → don't pass the flag (IPv6 included by default).
 
 - For **single report**: ask once.
-- For **multiple reports** (comparison): ask focus routes and IPv6 preference once, then price **per report** in order.
+- For **multiple reports** (comparison): ask focus routes and IPv6 preference once, then vendor/model and price **per report** in order.
 - Pass collected info to the parser via `--focus-routes`, `--price`, and `--skip-ipv6` flags.
+- Vendor/model is not a parser flag. Use it in the final verdict/title. When saving to the VPS library, pass it to `save_report.py --model`.
 - Price strings may use USD/CNY/EUR/HKD and monthly or annual periods, e.g. `$5/mo`, `29元/月`, `€4/月`, `HK$30/mo`, `$60/year`.
 
 ### Phase 2 — Fetch & Analyze
@@ -42,9 +45,19 @@ python scripts/parse_nodequality_report.py \
   "URL1" "URL2"
 ```
 
+If the report should be saved to the local VPS library, run `save_report.py` directly. It calls the parser internally and writes both JSON and CSV automatically; do not add a separate `--json` pipe:
+
+```bash
+python scripts/save_report.py \
+  --model "天翼云 2H4G HK" \
+  --price "续费$5.99/月" \
+  "https://nodequality.com/r/<token>"
+```
+
 ### Phase 3 — Respond
 
 Use the script's output as the factual basis. Highlight:
+- Vendor/model label if the user provided one
 - S/A 级维度 (green lights) and C/D 级维度 (red flags)
 - Focus routes performance
 - Cost-performance if price was provided
@@ -144,7 +157,7 @@ python scripts/parse_nodequality_report.py \
   --price "续费$5/月" --price "续费$8/月" --price "续费$12/月" \
   "URL1" "URL2" "URL3"
 
-# JSON output for scripting
+# JSON output for scripting only
 python scripts/parse_nodequality_report.py --json "<url>" | jq .
 
 # Dump everything for raw evidence
@@ -162,13 +175,10 @@ python scripts/parse_nodequality_report.py --record-json "./record.json"
 
 ## Save Report (VPS Library)
 
-The bundled `save_report.py` persists parsed reports to a local JSON + CSV library:
+The bundled `save_report.py` persists parsed reports to `vps-reports/json/<token>.json` and `vps-reports/reports.csv`. Direct mode calls the parser internally, so no extra `parse --json` pipe is needed:
 
 ```bash
-# Pipe from parser (recommended)
-python scripts/parse_nodequality_report.py --json "<url>" | python scripts/save_report.py --model "KVM-2G"
-
-# Direct mode (calls parser internally)
+# Save one report; JSON and CSV are written automatically
 python scripts/save_report.py --model "KVM-2G" --price "$5/mo" "https://nodequality.com/r/<token>"
 
 # Use a custom local library directory
